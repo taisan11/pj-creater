@@ -1,15 +1,13 @@
 # pj-creater
 
-To install dependencies:
+超低依存なテンプレートを元にプロジェクトの土台を作るやつ
 
-```bash
-bun install
-```
-
-To run:
-
-```bash
-bun run index.ts
-```
-
-This project was created using `bun init` in bun v1.3.8. [Bun](https://bun.com) is a fast all-in-one JavaScript runtime.
+## 特徴
+- 拡張性: 複数のテンプレートを定義でき、それらの動作を細かく調節できます。
+- 簡易性: コマンドでリポジトリを設定するだけで、TUIを用いて直感的に選べます。
+- 低依存性: 依存ファイルが少ないので高速かつ、少ない容量で動作します。
+## roadmap
+n p mに公開する
+Bunの依存をなくす
+もっと最適化をする
+0依存にする(かもしれない)
