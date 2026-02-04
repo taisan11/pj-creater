@@ -152,7 +152,7 @@ const loadConfigs = async (templateRoot: string) => {
 
   const merged: PromptConfig[] = [];
   const indexByName = new Map<string, number>();
-  let filesConfig: CreatorConfig["files"] | undefined;
+  let filesConfig: CreatorConfig["files"] = { include: [], exclude: [] };
   let configDir: string = templateRoot;
 
   for (const { config, configDir: dir } of configs) {
@@ -168,7 +168,16 @@ const loadConfigs = async (templateRoot: string) => {
       }
     }
     if (config.files) {
-      filesConfig = config.files;
+      // include と exclude と copyFrom を統合
+      if (config.files.include) {
+        filesConfig.include = config.files.include;
+      }
+      if (config.files.exclude) {
+        filesConfig.exclude = [...(filesConfig.exclude || []), ...config.files.exclude];
+      }
+      if (config.files.copyFrom) {
+        filesConfig.copyFrom = config.files.copyFrom;
+      }
       configDir = dir;
     }
   }

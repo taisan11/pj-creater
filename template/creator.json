@@ -6,5 +6,8 @@
         "type":"text",
         "message":"プロジェクト名を設定してください。",
         "initial":"test-project"
-    }]
+    }],
+    "files": {
+        "include": []
+    }
 }
