@@ -5,61 +5,27 @@ import { mkdir, lstat, readFile, readdir, rm, stat, writeFile } from "node:fs/pr
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
-import * as v from "valibot";
-
-type PromptType = "text" | "select" | "confirm";
-type PromptOption = string | { label: string; value: string; hint?: string };
-type PromptConfig = {
-  name: string;
-  type: PromptType;
-  message: string;
-  initial?: string;
-  options?: PromptOption[];
-};
-type CreaterConfig = {
-  name?: string;
-  description?: string;
-  prompts?: PromptConfig[];
-  files?: {
-    include?: string[];
-    exclude?: string[];
-  };
-};
-
-type TemplateSource =
-  | { kind: "local"; root: string }
-  | { kind: "github"; repo: string; path: string | null };
+import {safeParse} from "valibot";
+import { configSchema,GConfigSchema } from "./types";
+import type {TemplateSource, PromptConfig, CreaterConfig} from "./types";
 
 const CACHE_ROOT = join(homedir(), ".pj-creater", "cache");
+const CONFIG_PATH = join(homedir(),".pj-creater","config.json")
 const MANUAL_OPTION = "__manual__";
-const CACHE_TTL_MS = 1000 * 60 * 60 * 24 * 30;
+let CACHE_TTL_MS = 1000 * 60 * 60 * 24 * 30;
 
-const promptOptionSchema = v.union([
-  v.string(),
-  v.object({
-    label: v.string(),
-    value: v.string(),
-    hint: v.optional(v.string()),
-  }),
-]);
-const promptSchema = v.object({
-  name: v.string(),
-  type: v.picklist(["text", "select", "confirm"]),
-  message: v.string(),
-  initial: v.optional(v.string()),
-  options: v.optional(v.array(promptOptionSchema)),
-});
-const configSchema = v.object({
-  name: v.optional(v.string()),
-  description: v.optional(v.string()),
-  prompts: v.optional(v.array(promptSchema)),
-  files: v.optional(
-    v.object({
-      include: v.optional(v.array(v.string())),
-      exclude: v.optional(v.array(v.string())),
-    }),
-  ),
-});
+const ensureDefaultConfig = async () => {
+  const defaultConfig = { cache: { ttl: CACHE_TTL_MS } };
+  await writeFile(CONFIG_PATH, JSON.stringify(defaultConfig));
+  return defaultConfig;
+};
+
+async function loadConfig() {
+  if (!existsSync(CONFIG_PATH)) return ensureDefaultConfig();
+
+  const result = safeParse(GConfigSchema, await readFile(CONFIG_PATH));
+  return result.success ? result.output : ensureDefaultConfig();
+}
 
 const hasCommand = (cmd: string) => {
   const result = spawnSync(cmd, ["--version"], { stdio: "ignore" });
@@ -146,7 +112,7 @@ const loadConfigs = async (templateRoot: string) => {
     const absPath = join(templateRoot, relPath);
     const content = await readFile(absPath, "utf8");
     const parsed = JSON.parse(content) as unknown;
-    const result = v.safeParse(configSchema, parsed);
+    const result = safeParse(configSchema, parsed);
     if (!result.success) {
       throw new Error(`creater.json が不正です: ${absPath}`);
     }
@@ -245,6 +211,24 @@ const collectFileList = async (templateRoot: string, files: CreaterConfig["files
     }
   }
 
+  // copyFrom で指定されたディレクトリからもファイルを収集
+  if (files?.copyFrom?.length) {
+    for (const copyPath of files.copyFrom) {
+      const resolvedCopyPath = join(templateRoot, copyPath);
+      if (!existsSync(resolvedCopyPath)) continue;
+      
+      const copyStats = await stat(resolvedCopyPath);
+      if (!copyStats.isDirectory()) continue;
+
+      const glob = new Bun.Glob("**/*");
+      for await (const relPath of glob.scan({ cwd: resolvedCopyPath, dot: true })) {
+        // copyFrom のファイルに copyPath を prefix として付け直す
+        const prefixedPath = join(copyPath, relPath);
+        all.add(prefixedPath);
+      }
+    }
+  }
+
   return Array.from(all);
 };
 
@@ -282,6 +266,65 @@ const copyTemplate = async (
   }
 };
 
+type TemplateNode = {
+  name: string;
+  children: Map<string, TemplateNode>;
+  fullPath: string | null; // leaf node に設定
+};
+
+const buildTemplateTree = (paths: string[]): TemplateNode => {
+  const root: TemplateNode = { name: "root", children: new Map(), fullPath: null };
+
+  for (const path of paths) {
+    const segments: string[] = path.split("__").filter(Boolean);
+    let current = root;
+    for (let i = 0; i < segments.length; i++) {
+      const segment: string = segments[i]!;
+      if (!current.children.has(segment)) {
+        current.children.set(segment, {
+          name: segment,
+          children: new Map(),
+          fullPath: i === segments.length - 1 ? segments.join("/") : null,
+        });
+      }
+      current = current.children.get(segment)!;
+    }
+  }
+
+  return root;
+};
+
+const selectTemplate = async (node: TemplateNode, currentPath: string[] = []): Promise<string> => {
+  const options = Array.from(node.children.entries()).map(([name, child]) => ({
+    label: name,
+    value: name,
+  }));
+
+  // リーフノードはない場合は手入力オプション追加
+  const hasValidLeaves = Array.from(node.children.values()).some((child) => child.fullPath);
+
+  const picked = await select({
+    message: currentPath.length === 0 ? "テンプレートを選択してください" : `"${currentPath.join("/")}" の次を選択してください`,
+    options,
+  });
+
+  if (isCancel(picked)) {
+    cancel("キャンセルしました。");
+    process.exit(0);
+  }
+
+  const selectedNode = node.children.get(String(picked))!;
+  const nextPath = [...currentPath, String(picked)];
+
+  // リーフノードならそこまで
+  if (selectedNode.fullPath) {
+    return selectedNode.fullPath;
+  }
+
+  // さらに深い階層があればそこを選択
+  return selectTemplate(selectedNode, nextPath);
+};
+
 const pickTemplateArg = async (arg?: string) => {
   if (arg) return arg;
   await ensureCacheDir();
@@ -300,19 +343,10 @@ const pickTemplateArg = async (arg?: string) => {
     return String(result);
   }
 
-  const options = [
-    { label: "手入力する", value: MANUAL_OPTION },
-    ...cached.map((name) => ({
-      label: name.split("__").join("/"),
-      value: name,
-    })),
-  ];
-  const picked = await select({ message: "テンプレートを選択してください", options });
-  if (isCancel(picked)) {
-    cancel("キャンセルしました。");
-    process.exit(0);
-  }
-  if (picked === MANUAL_OPTION) {
+  const tree = buildTemplateTree(cached);
+  
+  // ルートに直下の子がない場合は手入力へ
+  if (tree.children.size === 0) {
     const result = await text({
       message: "テンプレートを指定してください (例: gh:username/repo/path)",
       placeholder: "gh:username/repo/path",
@@ -324,11 +358,55 @@ const pickTemplateArg = async (arg?: string) => {
     return String(result);
   }
 
-  return String(picked).split("__").join("/");
+  // 手入力オプションを追加
+  const optionsWithManual = [
+    { label: "手入力する", value: MANUAL_OPTION },
+    ...Array.from(tree.children.entries()).map(([name]) => ({
+      label: name,
+      value: name,
+    })),
+  ];
+
+  const firstPick = await select({
+    message: "テンプレートを選択してください",
+    options: optionsWithManual,
+  });
+
+  if (isCancel(firstPick)) {
+    cancel("キャンセルしました。");
+    process.exit(0);
+  }
+
+  if (firstPick === MANUAL_OPTION) {
+    const result = await text({
+      message: "テンプレートを指定してください (例: gh:username/repo/path)",
+      placeholder: "gh:username/repo/path",
+    });
+    if (isCancel(result)) {
+      cancel("キャンセルしました。");
+      process.exit(0);
+    }
+    return String(result);
+  }
+
+  const selectedNode = tree.children.get(String(firstPick))!;
+
+  // リーフノードならそこまで
+  if (selectedNode.fullPath) {
+    return selectedNode.fullPath;
+  }
+
+  // さらに深い階層があればそこを選択
+  return selectTemplate(selectedNode, [String(firstPick)]);
 };
 
 const main = async () => {
   intro("pj-creater");
+  if (!existsSync(CACHE_ROOT)) {
+    await mkdir(CACHE_ROOT)
+  }
+  const config = await loadConfig()
+  CACHE_TTL_MS = config.cache.ttl
 
   const args = process.argv.slice(2);
   const [firstArg] = args;

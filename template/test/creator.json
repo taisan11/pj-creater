@@ -1,0 +1,8 @@
+{
+    "$schema": "https://",
+    "name":"test-project",
+    "files":{
+        "exclude":["This_is_not_README"],
+        "copyFrom":["../neko"]
+    }
+}

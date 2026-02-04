@@ -1,0 +1,10 @@
+{
+    "$schema": "https://",
+    "name":"test-prompt",
+    "prompts":{
+        "name":"name",
+        "type":"string",
+        "message":"プロジェクト名を設定してください。",
+        "initial":"test-project"
+    }
+}
