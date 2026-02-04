@@ -1,0 +1,7 @@
+{
+    "$schema": "https://github.com/taisan11/pj-creater/raw/refs/heads/main/schema/createrConfig.schema.json",
+    "name":"nako-project",
+    "files":{
+        "include": ["./cat.txt"]
+    }
+}

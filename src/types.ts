@@ -9,7 +9,7 @@ export type PromptConfig = {
     initial?: string;
     options?: PromptOption[];
 };
-export type CreaterConfig = {
+export type CreatorConfig = {
     name?: string;
     description?: string;
     prompts?: PromptConfig[];
