@@ -1,5 +1,5 @@
 {
-    "$schema": "https://",
+    "$schema": "https://github.com/taisan11/pj-creater/raw/refs/heads/main/schema/createrConfig.schema.json",
     "name":"test-project",
     "files":{
         "exclude":["This_is_not_README"],

@@ -1,10 +1,10 @@
 {
-    "$schema": "https://",
+    "$schema": "https://github.com/taisan11/pj-creater/raw/refs/heads/main/schema/createrConfig.schema.json",
     "name":"test-prompt",
-    "prompts":{
+    "prompts":[{
         "name":"name",
-        "type":"string",
+        "type":"text",
         "message":"プロジェクト名を設定してください。",
         "initial":"test-project"
-    }
+    }]
 }
