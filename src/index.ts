@@ -122,67 +122,184 @@ const loadConfigs = async (templateRoot: string) => {
     configs.push({ path: absPath, depth, config, configDir });
   }
 
-  configs.sort((a, b) => a.depth - b.depth);
-  
-  // ルートレベルの creator.json がある場合
-  const rootConfig = configs.find((c) => c.depth === 1);
-  const subConfigs = configs.filter((c) => c.depth === 2);
+  return configs;
+};
 
-  // サブディレクトリの creator.json が複数ある場合、選択肢を追加
-  if (rootConfig && subConfigs.length > 0) {
-    const subOptions = subConfigs.map((c) => ({
-      label: basename(c.configDir),
-      value: c.configDir,
-    }));
+type DirectoryNode = {
+  name: string;
+  path: string;
+  children: Map<string, DirectoryNode>;
+  hasConfig: boolean;
+};
+
+const buildDirTree = async (rootPath: string): Promise<DirectoryNode> => {
+  const root: DirectoryNode = {
+    name: ".",
+    path: rootPath,
+    children: new Map(),
+    hasConfig: existsSync(join(rootPath, "creator.json")),
+  };
+
+  const queue: DirectoryNode[] = [root];
+  while (queue.length > 0) {
+    const node = queue.shift()!;
+    const entries = await readdir(node.path, { withFileTypes: true });
     
-    const hasTemplateSelector = rootConfig.config.prompts?.some((p) => p.name === "__template_selector__");
-    if (!hasTemplateSelector && subOptions.length > 0) {
-      const selectorPrompt: PromptConfig = {
-        name: "__template_selector__",
-        type: "select",
-        message: "テンプレートを選択してください",
-        options: subOptions,
-      };
-      if (!rootConfig.config.prompts) {
-        rootConfig.config.prompts = [];
+    for (const entry of entries) {
+      if (entry.isDirectory() && !entry.name.startsWith(".")) {
+        const childPath = join(node.path, entry.name);
+        const childNode: DirectoryNode = {
+          name: entry.name,
+          path: childPath,
+          children: new Map(),
+          hasConfig: existsSync(join(childPath, "creator.json")),
+        };
+        node.children.set(entry.name, childNode);
+        queue.push(childNode);
       }
-      rootConfig.config.prompts.unshift(selectorPrompt);
     }
   }
 
-  const merged: PromptConfig[] = [];
-  const indexByName = new Map<string, number>();
-  let filesConfig: CreatorConfig["files"] = { include: [], exclude: [] };
-  let configDir: string = templateRoot;
+  return root;
+};
 
-  for (const { config, configDir: dir } of configs) {
-    if (config.prompts) {
-      for (const prompt of config.prompts) {
-        const existingIndex = indexByName.get(prompt.name);
-        if (existingIndex === undefined) {
-          indexByName.set(prompt.name, merged.length);
-          merged.push(prompt);
-        } else {
-          merged[existingIndex] = prompt;
+const selectTemplateDir = async (
+  node: DirectoryNode,
+  pathStack: string[] = []
+): Promise<DirectoryNode> => {
+  // このディレクトリに creator.json がなければここが確定
+  if (!node.hasConfig) {
+    return node;
+  }
+
+  // 子ディレクトリがなければここが確定
+  if (node.children.size === 0) {
+    return node;
+  }
+
+  // 子ディレクトリを選択肢として表示
+  const options = Array.from(node.children.values()).map((child) => ({
+    label: child.name,
+    value: child.name,
+  }));
+
+  const picked = await select({
+    message: pathStack.length === 0
+      ? "テンプレートを選択してください"
+      : `"${pathStack.join("/")}" の次を選択してください`,
+    options,
+  });
+
+  if (isCancel(picked)) {
+    cancel("キャンセルしました。");
+    process.exit(0);
+  }
+
+  const selectedChild = node.children.get(String(picked));
+  if (!selectedChild) {
+    cancel("選択が無効です。");
+    process.exit(1);
+  }
+
+  return selectTemplateDir(selectedChild, [...pathStack, String(picked)]);
+};
+
+const collectAllConfigs = async (
+  selectedDir: DirectoryNode,
+  rootPath: string
+): Promise<{ configs: CreatorConfig[]; paths: string[]; selectedDirConfig: CreatorConfig | undefined }> => {
+  const configs: CreatorConfig[] = [];
+  const paths: string[] = [];
+  const visited = new Set<string>();
+  let selectedDirConfig: CreatorConfig | undefined;
+
+  // ルートから選択されたディレクトリまでのパスを生成
+  const pathChain: string[] = [];
+  let current = selectedDir.path;
+  while (current && current !== rootPath && !visited.has(current)) {
+    pathChain.unshift(current);
+    visited.add(current);
+    current = resolve(current, "..");
+  }
+  pathChain.unshift(rootPath); // ルートを追加
+
+  // 各階層の creator.json を読み込む
+  for (const dirPath of pathChain) {
+    const configPath = join(dirPath, "creator.json");
+    if (existsSync(configPath)) {
+      const content = await readFile(configPath, "utf8");
+      const parsed = JSON.parse(content) as unknown;
+      const result = safeParse(configSchema, parsed);
+      if (!result.success) {
+        throw new Error(`creator.json が不正です: ${configPath}`);
+      }
+      configs.push(result.output);
+      paths.push(dirPath);
+      
+      // 選択されたディレクトリの config を保存
+      if (dirPath === selectedDir.path) {
+        selectedDirConfig = result.output;
+      }
+    }
+  }
+
+  // copyFrom で指定されたディレクトリの config も収集（prompts のみ使用）
+  const toProcess: CreatorConfig[] = selectedDirConfig?.files?.copyFrom ? [selectedDirConfig] : [];
+  const processedCopyFroms = new Set<string>();
+  
+  while (toProcess.length > 0) {
+    const config = toProcess.shift();
+    if (config?.files?.copyFrom) {
+      for (const copyPath of config.files.copyFrom) {
+        // selectedDir を基準に解決
+        const resolvedPath = resolve(selectedDir.path, copyPath);
+        if (!visited.has(resolvedPath) && !processedCopyFroms.has(resolvedPath) && existsSync(resolvedPath)) {
+          visited.add(resolvedPath);
+          processedCopyFroms.add(resolvedPath);
+          const copyConfigPath = join(resolvedPath, "creator.json");
+          if (existsSync(copyConfigPath)) {
+            const content = await readFile(copyConfigPath, "utf8");
+            const parsed = JSON.parse(content) as unknown;
+            const result = safeParse(configSchema, parsed);
+            if (!result.success) {
+              throw new Error(`creator.json が不正です: ${copyConfigPath}`);
+            }
+            configs.push(result.output);
+            paths.push(resolvedPath);
+            // copyFrom の連鎖は prompts のみ収集するため、files.copyFrom は無視
+          }
         }
       }
     }
-    if (config.files) {
-      // include と exclude と copyFrom を統合
-      if (config.files.include) {
-        filesConfig.include = config.files.include;
+  }
+
+  return { configs, paths, selectedDirConfig };
+};
+
+const mergeConfigs = (
+  configs: CreatorConfig[],
+  selectedDirConfig: CreatorConfig | undefined
+): {
+  prompts: PromptConfig[];
+  files: CreatorConfig["files"];
+} => {
+  const promptMap = new Map<string, PromptConfig>();
+
+  // 全ての config から prompts をマージ
+  for (const config of configs) {
+    if (config.prompts) {
+      for (const prompt of config.prompts) {
+        promptMap.set(prompt.name, prompt);
       }
-      if (config.files.exclude) {
-        filesConfig.exclude = [...(filesConfig.exclude || []), ...config.files.exclude];
-      }
-      if (config.files.copyFrom) {
-        filesConfig.copyFrom = config.files.copyFrom;
-      }
-      configDir = dir;
     }
   }
 
-  return { prompts: merged, files: filesConfig, configDir, allConfigs: configs };
+  const mergedPrompts = Array.from(promptMap.values());
+
+  // files は選択されたディレクトリのもののみ使用（途中ディレクトリは無視）
+  const files = selectedDirConfig?.files || undefined;
+
+  return { prompts: mergedPrompts, files };
 };
 
 const askPrompts = async (prompts: PromptConfig[]) => {
@@ -233,16 +350,20 @@ const renderTemplate = (content: string, data: Record<string, string | boolean>)
     return value === undefined ? "" : String(value);
   });
 
-const collectFileList = async (templateRoot: string, configDir: string, files: CreatorConfig["files"]) => {
-  const all = new Set<string>();
+const collectFileList = async (
+  templateRoot: string,
+  configDir: string,
+  files: CreatorConfig["files"]
+): Promise<Array<{ sourcePath: string; targetPath: string }>> => {
+  const fileMap = new Map<string, string>(); // targetPath -> sourcePath
+
   const include = files?.include ?? ["**/*"];
   for (const pattern of include) {
     const glob = new Bun.Glob(pattern);
     for await (const relPath of glob.scan({ cwd: configDir, dot: true })) {
-      // configDir からの相対パスを templateRoot からの相対パスに変換
-      const fullPath = join(configDir, relPath);
-      const relFromRoot = resolve(fullPath).replace(resolve(templateRoot), "").replace(/^[\\/]/, "");
-      all.add(relFromRoot);
+      // configDir からの相対パス = そのまま出力先のパスとして使用
+      const sourcePath = join(configDir, relPath);
+      fileMap.set(relPath, sourcePath);
     }
   }
 
@@ -250,9 +371,7 @@ const collectFileList = async (templateRoot: string, configDir: string, files: C
     for (const pattern of files.exclude) {
       const glob = new Bun.Glob(pattern);
       for await (const relPath of glob.scan({ cwd: configDir, dot: true })) {
-        const fullPath = join(configDir, relPath);
-        const relFromRoot = resolve(fullPath).replace(resolve(templateRoot), "").replace(/^[\\/]/, "");
-        all.delete(relFromRoot);
+        fileMap.delete(relPath);
       }
     }
   }
@@ -268,15 +387,18 @@ const collectFileList = async (templateRoot: string, configDir: string, files: C
 
       const glob = new Bun.Glob("**/*");
       for await (const relPath of glob.scan({ cwd: resolvedCopyPath, dot: true })) {
-        // copyFrom のファイルを templateRoot 基準の相対パスに変換
-        const fullPath = join(resolvedCopyPath, relPath);
-        const relFromRoot = resolve(fullPath).replace(resolve(templateRoot), "").replace(/^[\\/]/, "");
-        all.add(relFromRoot);
+        const sourcePath = join(resolvedCopyPath, relPath);
+        // copyFrom のファイルは templateRoot からの相対パスで保存
+        const relFromRoot = resolve(sourcePath).replace(resolve(templateRoot) + "\\", "").replace(resolve(templateRoot) + "/", "");
+        fileMap.set(relFromRoot, sourcePath);
       }
     }
   }
 
-  return Array.from(all);
+  return Array.from(fileMap.entries()).map(([targetPath, sourcePath]) => ({
+    sourcePath,
+    targetPath,
+  }));
 };
 
 const copyTemplate = async (
@@ -286,32 +408,30 @@ const copyTemplate = async (
   configDir: string,
   files: CreatorConfig["files"],
 ) => {
-  const relPaths = await collectFileList(templateRoot, configDir, files);
+  const fileList = await collectFileList(templateRoot, configDir, files);
 
-  for (const relPath of relPaths) {
-    if (isSubPath(relPath, ".git")) continue;
-    if (relPath.endsWith("creator.json")) continue;
-    if (relPath.endsWith("creator.json")) continue;
+  for (const { sourcePath, targetPath } of fileList) {
+    if (isSubPath(targetPath, ".git")) continue;
+    if (targetPath.endsWith("creator.json")) continue;
 
-    const sourcePath = join(templateRoot, relPath);
     const stat = await lstat(sourcePath);
-    const targetPath = join(outputRoot, relPath);
+    const fullTargetPath = join(outputRoot, targetPath);
 
     if (stat.isDirectory()) {
-      await mkdir(targetPath, { recursive: true });
+      await mkdir(fullTargetPath, { recursive: true });
       continue;
     }
     if (!stat.isFile()) continue;
 
-    await mkdir(join(targetPath, ".."), { recursive: true });
+    await mkdir(join(fullTargetPath, ".."), { recursive: true });
     const buffer = await readFile(sourcePath);
     if (isBinaryBuffer(buffer)) {
-      await writeFile(targetPath, buffer);
+      await writeFile(fullTargetPath, buffer);
       continue;
     }
     const content = buffer.toString("utf8");
     const rendered = renderTemplate(content, data);
-    await writeFile(targetPath, rendered, "utf8");
+    await writeFile(fullTargetPath, rendered, "utf8");
   }
 };
 
@@ -502,26 +622,18 @@ const main = async () => {
     }
   }
 
-  const { prompts, files, configDir, allConfigs } = await loadConfigs(templateRoot);
+  // 新しい仕組み：ディレクトリツリーを構築して選択
+  const dirTree = await buildDirTree(templateRoot);
+  const selectedDir = await selectTemplateDir(dirTree);
+
+  // 選択されたディレクトリまでの全ての creator.json を収集＆マージ
+  const { configs, paths, selectedDirConfig } = await collectAllConfigs(selectedDir, templateRoot);
+  const { prompts, files } = mergeConfigs(configs, selectedDirConfig);
+
   const values = prompts.length ? await askPrompts(prompts) : {};
   
-  // ユーザーが __template_selector__ で選択した場合、その configDir を使用
-  let finalConfigDir = configDir;
-  if (values.__template_selector__) {
-    finalConfigDir = String(values.__template_selector__);
-    
-    // 選択されたディレクトリの config を特定
-    const selectedConfig = allConfigs.find((c) => c.configDir === finalConfigDir);
-    if (selectedConfig) {
-      // 選択されたディレクトリの files 設定を使用
-      const selectedFilesConfig = selectedConfig.config.files;
-      await copyTemplate(templateRoot, outputRoot, values, finalConfigDir, selectedFilesConfig);
-    } else {
-      await copyTemplate(templateRoot, outputRoot, values, finalConfigDir, files);
-    }
-  } else {
-    await copyTemplate(templateRoot, outputRoot, values, finalConfigDir, files);
-  }
+  // selectedDir がテンプレートの実際のルート
+  await copyTemplate(templateRoot, outputRoot, values, selectedDir.path, files);
 
   outro("テンプレートを作成しました。");
 };
